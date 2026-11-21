@@ -42,10 +42,17 @@ jobs:
           else
             sudo apt-get install -y --no-install-recommends llvm-dev libclang-dev libclc-dev libllvmspirvlib-dev || true
           fi
-          sudo apt-get install -y --no-install-recommends spirv-tools || true
-          sudo apt-get install -y --no-install-recommends libspirv-tools-dev || true
-          sudo apt-get install -y --no-install-recommends glslang-tools || true
-          PCDIRS=$(find /usr -name 'libclc*.pc' -o -name 'SPIRV-Tools*.pc' 2>/dev/null | xargs -r -n1 dirname | sort -u | paste -sd:)
+          sudo apt-get install -y --no-install-recommends glslang-tools spirv-headers || true
+          # This runner image ships no SPIRV-Tools pkg-config/cmake package, so build it.
+          export PATH="$HOME/.local/bin:$PATH"
+          git clone -q --depth 1 https://github.com/KhronosGroup/SPIRV-Tools.git /tmp/spirv-tools-src
+          HDR=$(grep -oP "'spirv_headers_revision':\s*'\K[0-9a-f]+" /tmp/spirv-tools-src/DEPS)
+          echo "SPIRV-Headers revision: $HDR"
+          git clone -q https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-tools-src/external/spirv-headers
+          git -C /tmp/spirv-tools-src/external/spirv-headers checkout -q "$HDR"
+          cmake -S /tmp/spirv-tools-src -B /tmp/spirv-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/spirv-install" -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON -DSPIRV_WERROR=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          ninja -C /tmp/spirv-build install
+          PCDIRS=$(find /usr "$HOME/spirv-install" \( -name 'libclc*.pc' -o -name 'SPIRV-Tools*.pc' -o -name 'LLVMSPIRVLib.pc' \) 2>/dev/null | xargs -r -n1 dirname | sort -u | paste -sd:)
           echo "PKG_CONFIG_PATH=$PCDIRS" >> "$GITHUB_ENV"
           echo "pkg-config dirs: $PCDIRS"
 
