@@ -1,0 +1,71 @@
+name: source-dump
+
+# Stage A (read-only): fetch the pinned Mesa, apply this repo's patch series,
+# and print / upload the native-buffer and gralloc source files for review.
+# It builds nothing and publishes nothing.
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out only what the scripts need
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            patches
+            scripts
+            profiles
+            meson
+          sparse-checkout-cone-mode: true
+
+      - name: Fetch pinned Mesa
+        shell: bash
+        run: ./scripts/fetch-mesa.sh
+
+      - name: Apply patch series (universal profile)
+        shell: bash
+        run: |
+          mkdir -p out
+          ./scripts/apply-patches.sh --profile g615-v11-csf 2>&1 | tee out/apply.log
+
+      - name: Collect native-buffer and gralloc sources
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p out/src
+          if [ -d work/mesa ]; then
+            cd work/mesa
+            git rev-parse HEAD > ../../out/mesa-commit.txt || true
+            grep -rlE "VkNativeBufferANDROID|GetSwapchainGrallocUsage|AcquireImageANDROID|vk_android_|u_gralloc" src > ../../out/files.txt || true
+            grep -rnE "VkNativeBufferANDROID|vk_android_get_anb|vk_android_import_anb|GetSwapchainGrallocUsage|vk_android_set_owned_ahb|vk_android_probe" src > ../../out/grep.txt || true
+            while read -r f; do cp --parents "$f" ../../out/src/; done < ../../out/files.txt
+          fi
+
+      - name: Print key files to the log
+        if: always()
+        shell: bash
+        run: |
+          cd out
+          for f in mesa-commit.txt files.txt grep.txt; do echo "::group::$f"; cat "$f" 2>/dev/null; echo "::endgroup::"; done
+          for f in src/src/vulkan/runtime/vk_android.c src/src/vulkan/runtime/vk_android.h src/src/util/u_gralloc/u_gralloc_fallback.c; do
+            echo "::group::$f"; cat -n "$f" 2>/dev/null; echo "::endgroup::"
+          done
+          if [ -d ../work/mesa ]; then
+            echo "::group::other ANB call sites (context)"
+            cd ../work/mesa
+            grep -rn -C20 -E "VkNativeBufferANDROID|vk_android_get_anb|vk_android_import_anb" src --include=*.c --include=*.h --exclude=vk_android.c --exclude=vk_android.h | head -n 1500
+            echo "::endgroup::"
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: panvk-anb-sources
+          path: out/
