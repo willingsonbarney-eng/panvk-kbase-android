@@ -1,0 +1,299 @@
+diff --git a/src/vulkan/runtime/vk_android.c b/src/vulkan/runtime/vk_android.c
+index 97637ed..58a3ed3 100644
+--- a/src/vulkan/runtime/vk_android.c
++++ b/src/vulkan/runtime/vk_android.c
+@@ -51,6 +51,7 @@
+ #include <vndk/hardware_buffer.h>
+ #endif
+ 
++#include <pthread.h>
+ #include <unistd.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+@@ -305,6 +306,14 @@ vk_android_import_anb(struct vk_device *device,
+    return device->dispatch_table.BindImageMemory2((VkDevice)device, 1, &bind_info);
+ }
+ 
++#if ANDROID_API_LEVEL >= 26
++static VkResult
++vk_android_probe_linear_anb(const VkImageCreateInfo *pCreateInfo,
++                            const VkNativeBufferANDROID *nb,
++                            VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
++                            VkSubresourceLayout *out_layouts, int max_planes);
++#endif
++
+ VkResult
+ vk_android_get_anb_layout(
+    const VkImageCreateInfo *pCreateInfo,
+@@ -320,8 +329,16 @@ vk_android_get_anb_layout(
+       .pixel_stride = native_buffer->stride,
+    };
+ 
+-   return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
+-                                            out_layouts, max_planes);
++   VkResult result = vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
++                                                       out_layouts, max_planes);
++#if ANDROID_API_LEVEL >= 26
++   /* Platform-loader / HAL-hook route: the loader owns the swapchain buffers
++    * and the gralloc mapper may be unreachable from the app namespace. */
++   if (result == VK_ERROR_INVALID_EXTERNAL_HANDLE)
++      result = vk_android_probe_linear_anb(pCreateInfo, native_buffer, out,
++                                           out_layouts, max_planes);
++#endif
++   return result;
+ }
+ 
+ VkResult
+@@ -644,6 +661,62 @@ vk_android_get_front_buffer_usage(void)
+    return 0;
+ }
+ 
++/* Raw gralloc usage bits (AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER and
++ * COMPOSER_OVERLAY), spelled out so older NDK headers cannot break the build. */
++#define VK_ANB_USAGE_GPU_FRAMEBUFFER (1ULL << 9)
++#define VK_ANB_USAGE_COMPOSER_OVERLAY (1ULL << 11)
++/* Same value as GRALLOC1_CONSUMER_USAGE_CPU_READ_OFTEN in hardware/gralloc1.h. */
++#define VK_ANB_GRALLOC1_CPU_READ_OFTEN ((1ULL << 2) | (1ULL << 1))
++
++static pthread_mutex_t vk_anb_lock = PTHREAD_MUTEX_INITIALIZER;
++static int vk_android_mapperless_state; /* 0 unknown, 1 mapper ok, 2 unreachable */
++
++/* On the platform-loader route the vendor gralloc mapper can be unreachable
++ * from the app namespace (see vk_android_probe_linear_ahb). Detect that once
++ * with a small throwaway AHB. Only when the mapper cannot describe it, the
++ * swapchain buffers are requested with CPU read usage so that
++ * vk_android_probe_linear_anb() can verify their layout. Where the mapper
++ * works nothing changes. */
++static bool
++vk_android_mapperless(void)
++{
++   pthread_mutex_lock(&vk_anb_lock);
++   int state = vk_android_mapperless_state;
++   if (state == 0) {
++      state = 1;
++      AHardwareBuffer_Desc d = {
++         .width = 64,
++         .height = 64,
++         .layers = 1,
++         .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
++         .usage = VK_ANB_USAGE_GPU_FRAMEBUFFER |
++                  AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
++                  AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
++      };
++      struct AHardwareBuffer *ahb = NULL;
++      struct u_gralloc *ug = vk_android_get_ugralloc();
++      if (ug && AHardwareBuffer_allocate(&d, &ahb) == 0 && ahb) {
++         AHardwareBuffer_Desc got;
++         AHardwareBuffer_describe(ahb, &got);
++         struct u_gralloc_buffer_handle gh = {
++            .handle = AHardwareBuffer_getNativeHandle(ahb),
++            .pixel_stride = got.stride,
++            .hal_format = got.format,
++         };
++         struct u_gralloc_buffer_basic_info info;
++         if (u_gralloc_get_buffer_basic_info(ug, &gh, &info) != 0)
++            state = 2;
++         AHardwareBuffer_release(ahb);
++      }
++      vk_android_mapperless_state = state;
++      mesa_logi("[PANVK-ANB] mapper probe: %s",
++                state == 2 ? "mapper unreachable, CPU-read swapchain usage on"
++                           : "mapper ok, swapchain usage unchanged");
++   }
++   pthread_mutex_unlock(&vk_anb_lock);
++   return state == 2;
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ vk_common_GetSwapchainGrallocUsage2ANDROID(
+    VkDevice device, VkFormat format, VkImageUsageFlags imageUsage,
+@@ -666,6 +739,14 @@ vk_common_GetSwapchainGrallocUsage2ANDROID(
+    if (swapchainImageUsage & VK_SWAPCHAIN_IMAGE_USAGE_SHARED_BIT_ANDROID)
+       *grallocProducerUsage |= vk_android_get_front_buffer_usage();
+ 
++   if (vk_android_mapperless())
++      *grallocConsumerUsage |= VK_ANB_GRALLOC1_CPU_READ_OFTEN;
++
++   mesa_logi("[PANVK-ANB] swapchain gralloc usage: vkformat=%d imageUsage=%#x swapchainUsage=%#x -> consumer=%#llx producer=%#llx",
++             (int)format, (unsigned)imageUsage, (unsigned)swapchainImageUsage,
++             (unsigned long long)*grallocConsumerUsage,
++             (unsigned long long)*grallocProducerUsage);
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -772,6 +853,174 @@ done:
+    return VK_SUCCESS;
+ }
+ 
++/* Mapper-less swapchain buffers on the platform-loader route.
++ *
++ * The loader allocates these buffers, so their layout cannot be proven the way
++ * vk_android_probe_linear_ahb() does for buffers the driver owns. Instead,
++ * allocate a sibling AHardwareBuffer with the same size and format (and a few
++ * candidate usages), prove the sibling linear with the cookie probe, and accept
++ * only if the sibling matches the loader's buffer in stride, dma-buf size and
++ * handle shape. Anything else is refused, exactly as before this path existed.
++ * The loader's buffer is never written. */
++#define VK_ANB_CACHE_SIZE 8
++
++struct vk_anb_cache_entry {
++   uint32_t width, height, stride;
++   int fds, ints, format;
++   uint64_t size;
++   bool valid, linear;
++};
++
++static struct vk_anb_cache_entry vk_anb_cache[VK_ANB_CACHE_SIZE];
++static unsigned vk_anb_cache_next;
++
++static uint64_t
++vk_anb_dmabuf_size(const native_handle_t *h)
++{
++   for (int i = 0; h && i < h->numFds; i++) {
++      int fd = h->data[i];
++      if (fd < 0)
++         continue;
++      off_t s = lseek(fd, 0, SEEK_END);
++      lseek(fd, 0, SEEK_SET);
++      if (s > 0)
++         return (uint64_t)s;
++   }
++   return 0;
++}
++
++static void
++vk_anb_fill_linear(uint64_t pitch,
++                   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
++                   VkSubresourceLayout *out_layouts, int max_planes)
++{
++   memset(out, 0, sizeof(*out));
++   memset(out_layouts, 0, sizeof(*out_layouts) * max_planes);
++   out->sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
++   out->pPlaneLayouts = out_layouts;
++   out->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
++   out->drmFormatModifierPlaneCount = 1;
++   out_layouts[0].rowPitch = pitch;
++}
++
++static VkResult
++vk_android_probe_linear_anb(const VkImageCreateInfo *ci,
++                            const VkNativeBufferANDROID *nb,
++                            VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
++                            VkSubresourceLayout *out_layouts, int max_planes)
++{
++   static const uint64_t variants[] = {
++      VK_ANB_USAGE_GPU_FRAMEBUFFER | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
++         AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
++      VK_ANB_USAGE_GPU_FRAMEBUFFER | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
++         AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | VK_ANB_USAGE_COMPOSER_OVERLAY,
++   };
++   const native_handle_t *h = nb ? nb->handle : NULL;
++   const uint32_t w = ci->extent.width, ht = ci->extent.height;
++   const uint32_t stride = nb ? (uint32_t)nb->stride : 0;
++   const uint64_t size = vk_anb_dmabuf_size(h);
++   const char *why = NULL;
++   bool linear = false, cached = false, filled = false;
++
++   mesa_logi("[PANVK-ANB] import: vkfmt=%d hal_format=%d stride=%d usage=%#x extent=%ux%u layers=%u mips=%u fds=%d ints=%d dmabuf_size=%llu",
++             (int)ci->format, nb ? nb->format : -1, nb ? nb->stride : -1,
++             nb ? (unsigned)nb->usage : 0u, w, ht, ci->arrayLayers,
++             ci->mipLevels, h ? h->numFds : -1, h ? h->numInts : -1,
++             (unsigned long long)size);
++
++   if (!h || h->numFds < 1 || max_planes < 1)
++      why = "no dma-buf handle";
++   else if (ci->arrayLayers != 1 || ci->mipLevels != 1)
++      why = "layers or mips != 1";
++   else if (nb->format != 1 && nb->format != 2)
++      why = "hal format is not RGBA8888/RGBX8888";
++   else if (!w || !ht || stride < w)
++      why = "bad extent or stride";
++   else if (!size || (uint64_t)stride * 4 * ht > size)
++      why = "dma-buf smaller than pitch * height";
++   else if (!vk_android_mapperless())
++      why = "mapper reachable, failure has another cause";
++
++   if (!why) {
++      pthread_mutex_lock(&vk_anb_lock);
++      for (unsigned i = 0; i < VK_ANB_CACHE_SIZE; i++) {
++         const struct vk_anb_cache_entry *e = &vk_anb_cache[i];
++         if (e->valid && e->width == w && e->height == ht &&
++             e->stride == stride && e->size == size &&
++             e->format == nb->format && e->fds == h->numFds &&
++             e->ints == h->numInts) {
++            cached = true;
++            linear = e->linear;
++            break;
++         }
++      }
++      pthread_mutex_unlock(&vk_anb_lock);
++   }
++
++   if (!why && cached) {
++      if (linear) {
++         vk_anb_fill_linear((uint64_t)stride * 4, out, out_layouts, max_planes);
++         filled = true;
++      } else {
++         why = "cached refusal";
++      }
++   }
++
++   if (!why && !cached) {
++      why = "no sibling buffer matched";
++      for (unsigned v = 0; v < (sizeof(variants) / sizeof(variants[0])) && !linear; v++) {
++         AHardwareBuffer_Desc d = {
++            .width = w,
++            .height = ht,
++            .layers = 1,
++            .format = nb->format,
++            .usage = variants[v],
++         };
++         struct AHardwareBuffer *sib = NULL;
++         if (AHardwareBuffer_allocate(&d, &sib) != 0 || !sib) {
++            mesa_logi("[PANVK-ANB] sibling %u: allocate failed", v);
++            continue;
++         }
++         AHardwareBuffer_Desc sd;
++         AHardwareBuffer_describe(sib, &sd);
++         const native_handle_t *sh = AHardwareBuffer_getNativeHandle(sib);
++         const uint64_t ssize = vk_anb_dmabuf_size(sh);
++         const bool same = sh && sd.stride == stride && ssize == size &&
++                           sh->numFds == h->numFds && sh->numInts == h->numInts;
++         mesa_logi("[PANVK-ANB] sibling %u: usage=%#llx stride=%u dmabuf_size=%llu fds=%d ints=%d same_as_loader_buffer=%d",
++                   v, (unsigned long long)variants[v], sd.stride,
++                   (unsigned long long)ssize, sh ? sh->numFds : -1,
++                   sh ? sh->numInts : -1, (int)same);
++         if (same) {
++            vk_android_set_owned_ahb(sib);
++            VkResult r = vk_android_probe_linear_ahb(sib, &sd, sh, out,
++                                                     out_layouts, max_planes);
++            vk_android_set_owned_ahb(NULL);
++            if (r == VK_SUCCESS) {
++               linear = true;
++               filled = true;
++               why = NULL;
++            }
++         }
++         AHardwareBuffer_release(sib);
++      }
++
++      pthread_mutex_lock(&vk_anb_lock);
++      vk_anb_cache[vk_anb_cache_next++ % VK_ANB_CACHE_SIZE] =
++         (struct vk_anb_cache_entry){
++            .width = w, .height = ht, .stride = stride, .fds = h->numFds,
++            .ints = h->numInts, .format = nb->format, .size = size,
++            .valid = true, .linear = linear,
++         };
++      pthread_mutex_unlock(&vk_anb_lock);
++   }
++
++   mesa_logi("[PANVK-ANB] decision: %s%s%s",
++             filled ? "LINEAR (verified by sibling probe)" : "REFUSED",
++             why ? ": " : "", why ? why : "");
++   return filled ? VK_SUCCESS : VK_ERROR_INVALID_EXTERNAL_HANDLE;
++}
++
+ VkResult
+ vk_android_get_ahb_layout(
+    struct AHardwareBuffer *ahardware_buffer,
