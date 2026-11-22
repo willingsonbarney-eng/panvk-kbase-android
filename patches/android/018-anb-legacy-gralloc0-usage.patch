@@ -1,0 +1,35 @@
+diff --git a/src/vulkan/runtime/vk_android.c b/src/vulkan/runtime/vk_android.c
+index 58a3ed3..0665c47 100644
+--- a/src/vulkan/runtime/vk_android.c
++++ b/src/vulkan/runtime/vk_android.c
+@@ -312,6 +312,9 @@ vk_android_probe_linear_anb(const VkImageCreateInfo *pCreateInfo,
+                             const VkNativeBufferANDROID *nb,
+                             VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+                             VkSubresourceLayout *out_layouts, int max_planes);
++static bool vk_android_mapperless(void);
++/* GRALLOC_USAGE_SW_READ_OFTEN (gralloc0 encoding), spelled out in case the stub header lacks it. */
++#define VK_ANB_GRALLOC0_SW_READ_OFTEN 0x3
+ #endif
+ 
+ VkResult
+@@ -483,7 +486,19 @@ vk_common_GetSwapchainGrallocUsageANDROID(VkDevice device, VkFormat format,
+                                           VkImageUsageFlags imageUsage,
+                                           int *grallocUsage)
+ {
+-   return setup_gralloc0_usage(format, imageUsage, grallocUsage);
++   VkResult result = setup_gralloc0_usage(format, imageUsage, grallocUsage);
++#if ANDROID_API_LEVEL >= 26
++   /* Recent Android loaders ask through this legacy entry point. Same rule as
++    * the v2 entry point: only when the gralloc mapper is unreachable, request
++    * CPU read usage so loader-owned swapchain buffers come out linear and can
++    * be verified by vk_android_probe_linear_anb(). */
++   if (result == VK_SUCCESS && vk_android_mapperless())
++      *grallocUsage |= VK_ANB_GRALLOC0_SW_READ_OFTEN;
++   if (result == VK_SUCCESS)
++      mesa_logi("[PANVK-ANB] legacy swapchain gralloc usage: vkformat=%d imageUsage=%#x -> usage=%#x",
++                (int)format, (unsigned)imageUsage, (unsigned)*grallocUsage);
++#endif
++   return result;
+ }
+ 
+ 
