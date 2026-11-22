@@ -93,7 +93,7 @@ jobs:
         run: |
           git config --global user.name "ci"
           git config --global user.email "ci@example.invalid"
-          ./scripts/prepare-rc5-tree.sh --mesa work/mesa 2>&1 | tail -n 40
+          sh ./scripts/prepare-rc5-tree.sh --mesa work/mesa 2>&1 | tail -n 40
 
       - name: Build host tools
         shell: bash
