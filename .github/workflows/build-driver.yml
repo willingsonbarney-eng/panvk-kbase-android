@@ -38,6 +38,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config bison flex cmake zip wget gnupg lsb-release ca-certificates software-properties-common zlib1g-dev libexpat1-dev libzstd-dev libelf-dev libdrm-dev python3-pip
           sudo apt-get install -y --no-install-recommends libx11-dev libx11-xcb-dev libxcb1-dev libxshmfence-dev xorgproto || sudo apt-get install -y --no-install-recommends libx11-dev libx11-xcb-dev libxcb1-dev libxshmfence-dev x11proto-dev
+          sudo apt-get install -y --no-install-recommends libxcb-shm0-dev libxcb-dri3-dev libxcb-present-dev libxcb-randr0-dev libxcb-sync-dev libxcb-xfixes0-dev
           python3 -m pip install --user --break-system-packages "meson>=1.7" ninja mako pyyaml packaging pycparser ply || python3 -m pip install --user "meson>=1.7" ninja mako pyyaml packaging pycparser ply
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
