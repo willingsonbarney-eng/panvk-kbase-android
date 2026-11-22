@@ -88,9 +88,12 @@ jobs:
         shell: bash
         run: ./scripts/fetch-mesa.sh
 
-      - name: Apply patch series
+      - name: Prepare universal tree (all patch families + jm-v7-wip, like the release)
         shell: bash
-        run: ./scripts/apply-patches.sh --profile g615-v11-csf
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+          ./scripts/prepare-rc5-tree.sh --mesa work/mesa 2>&1 | tail -n 40
 
       - name: Build host tools
         shell: bash
