@@ -1,0 +1,62 @@
+diff --git a/src/vulkan/runtime/vk_android.c b/src/vulkan/runtime/vk_android.c
+index 0665c47..4823c67 100644
+--- a/src/vulkan/runtime/vk_android.c
++++ b/src/vulkan/runtime/vk_android.c
+@@ -52,6 +52,7 @@
+ #endif
+ 
+ #include <pthread.h>
++#include <stdio.h>
+ #include <unistd.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+@@ -918,6 +919,32 @@ vk_anb_fill_linear(uint64_t pitch,
+    out_layouts[0].rowPitch = pitch;
+ }
+ 
++/* Diagnostics: dump the raw native handle (fd sizes and every int) so the
++ * vendor's private buffer layout can be decoded offline by comparing the
++ * loader's buffer with a known-linear sibling. Logging only. */
++static void
++vk_anb_dump_handle(const char *tag, const native_handle_t *h)
++{
++   if (!h)
++      return;
++   for (int i = 0; i < h->numFds; i++) {
++      off_t s = -1;
++      if (h->data[i] >= 0) {
++         s = lseek(h->data[i], 0, SEEK_END);
++         lseek(h->data[i], 0, SEEK_SET);
++      }
++      mesa_logi("[PANVK-ANB] %s fd%d size=%lld", tag, i, (long long)s);
++   }
++   const int *ints = &h->data[h->numFds];
++   for (int i = 0; i < h->numInts; i += 8) {
++      char buf[160];
++      int n = 0;
++      for (int j = i; j < i + 8 && j < h->numInts; j++)
++         n += snprintf(buf + n, sizeof(buf) - n, " %08x", (unsigned)ints[j]);
++      mesa_logi("[PANVK-ANB] %s ints[%d..]:%s", tag, i, buf);
++   }
++}
++
+ static VkResult
+ vk_android_probe_linear_anb(const VkImageCreateInfo *ci,
+                             const VkNativeBufferANDROID *nb,
+@@ -942,6 +969,7 @@ vk_android_probe_linear_anb(const VkImageCreateInfo *ci,
+              nb ? (unsigned)nb->usage : 0u, w, ht, ci->arrayLayers,
+              ci->mipLevels, h ? h->numFds : -1, h ? h->numInts : -1,
+              (unsigned long long)size);
++   vk_anb_dump_handle("loader", h);
+ 
+    if (!h || h->numFds < 1 || max_planes < 1)
+       why = "no dma-buf handle";
+@@ -1006,6 +1034,8 @@ vk_android_probe_linear_anb(const VkImageCreateInfo *ci,
+                    v, (unsigned long long)variants[v], sd.stride,
+                    (unsigned long long)ssize, sh ? sh->numFds : -1,
+                    sh ? sh->numInts : -1, (int)same);
++         if (v == 0)
++            vk_anb_dump_handle("sibling0", sh);
+          if (same) {
+             vk_android_set_owned_ahb(sib);
+             VkResult r = vk_android_probe_linear_ahb(sib, &sd, sh, out,
