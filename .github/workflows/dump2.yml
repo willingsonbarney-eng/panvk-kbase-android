@@ -1,0 +1,52 @@
+name: dump2
+
+# Read-only: prepare the same universal tree as build-driver and print how the
+# Android native-buffer entry points are wired. Builds nothing. Manual trigger.
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            patches
+            scripts
+            profiles
+            meson
+          sparse-checkout-cone-mode: true
+
+      - name: Fetch and prepare tree
+        shell: bash
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+          ./scripts/fetch-mesa.sh
+          sh ./scripts/prepare-rc5-tree.sh --mesa work/mesa 2>&1 | tail -n 5
+
+      - name: Print wiring
+        shell: bash
+        run: |
+          cd work/mesa
+          echo "::group::ANDROID_native_buffer mentions"
+          grep -rn "ANDROID_native_buffer" src --include=*.c --include=*.h | grep -v "^src/vulkan/registry" | head -60
+          echo "::endgroup::"
+          echo "::group::GetSwapchainGrallocUsage mentions"
+          grep -rn "GetSwapchainGrallocUsage" src --include=*.c --include=*.h --include=*.py | head -30
+          echo "::endgroup::"
+          echo "::group::vk_common_GetDeviceProcAddr"
+          grep -n "vk_common_GetDeviceProcAddr" -A28 src/vulkan/runtime/vk_device.c | head -70
+          echo "::endgroup::"
+          echo "::group::how the HAL / ICD exposes device procs"
+          grep -rln "hwvulkan" src/panfrost src/vulkan --include=*.c --include=*.h | head
+          grep -rn "GetDeviceProcAddr" src/panfrost/vulkan/*.c | head -20
+          echo "::endgroup::"
+          echo "::group::panvk_android.c around the ANB call sites"
+          grep -n "" src/panfrost/vulkan/panvk_android.c | sed -n '90,240p'
+          echo "::endgroup::"
