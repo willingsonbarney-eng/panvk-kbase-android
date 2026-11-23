@@ -95,6 +95,30 @@ jobs:
           git config --global user.email "ci@example.invalid"
           sh ./scripts/prepare-rc5-tree.sh --mesa work/mesa 2>&1 | tail -n 40
 
+      - name: Diagnostics - log ANDROID proc lookups (temporary, logging only)
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re
+          p = 'work/mesa/src/vulkan/runtime/vk_device.c'
+          s = open(p).read()
+          pat = re.compile(r'(vk_common_GetDeviceProcAddr\(VkDevice _device,\s*const char \*pName\)\s*\{\s*VK_FROM_HANDLE\(vk_device, device, _device\);\s*)return vk_device_get_proc_addr\(device, pName\);')
+          assert len(pat.findall(s)) == 1, "GetDeviceProcAddr body not found exactly once"
+          new = (r'\1PFN_vkVoidFunction fn = vk_device_get_proc_addr(device, pName);' + "\n"
+                 '   if (pName && strstr(pName, "ANDROID"))' + "\n"
+                 '      mesa_logi("[PANVK-ANB] GetDeviceProcAddr(%s) -> %s (ANDROID_native_buffer enabled=%d)",' + "\n"
+                 '                pName, fn ? "found" : "NULL", (int)device->enabled_extensions.ANDROID_native_buffer);' + "\n"
+                 '   return fn;')
+          s = pat.sub(new, s, count=1)
+          if '#include <string.h>' not in s:
+              s = s.replace('#include "vk_device.h"\n', '#include "vk_device.h"\n#include <string.h>\n', 1)
+          if '#include "util/log.h"' not in s:
+              s = s.replace('#include "vk_device.h"\n', '#include "vk_device.h"\n#include "util/log.h"\n', 1)
+          open(p, 'w').write(s)
+          print("patched", p)
+          PY
+          grep -n "PANVK-ANB" work/mesa/src/vulkan/runtime/vk_device.c
+
       - name: Build host tools
         shell: bash
         run: |
